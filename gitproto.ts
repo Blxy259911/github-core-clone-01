@@ -140,26 +140,16 @@ export function buildPack(objects: ReadonlyArray<{ oid: string; type: GitObject[
   return pack;
 }
 
-/** Adler-32 of `data` (zlib's checksum); one pass with the modulo deferred to the end. */
-function adler32(data: Buffer): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a += data[i];
-    b += a;
-  }
-  a %= 65521;
-  b %= 65521;
-  return ((b << 16) | a) >>> 0;
-}
+/** Result shape of inflateSync(buf, { info: true }) on Node 22. */
+type InflateInfo = { buffer: Buffer; engine: { bytesWritten: number } };
 
 /**
  * Inflate the zlib stream starting at `start` and return its bytes plus the offset
- * just past it. inflateSync stops at the stream's end and ignores what follows, so
- * the stream's end is found by its Adler-32 trailer: the 4 trailer bytes are
- * searched for, and the first candidate that inflates to exactly `size` bytes is
- * the stream's end — a shorter prefix cannot inflate to the full size, because a
- * zlib stream only ever ends on its final block.
+ * just past it. inflateSync with { info: true } returns the decompressed buffer
+ * and the engine, whose bytesWritten is exactly the number of compressed bytes
+ * the stream consumed (header + data + Adler-32 trailer) — verified on Node
+ * 22.21.0, including streams followed by trailing bytes. One decompression,
+ * no trailer search.
  */
 function inflateEntry(buf: Buffer, start: number, size: number): { data: Buffer; next: number } {
   // The compressed form of `size` bytes is at most the stored form plus its
@@ -167,32 +157,21 @@ function inflateEntry(buf: Buffer, start: number, size: number): { data: Buffer;
   // back to the full remainder if the bound ever proves too small, and a corrupt
   // stream throws from both.
   const bound = size + 32 + 5 * Math.ceil(size / 65535);
-  let data: Buffer;
+  let result: InflateInfo;
   try {
-    data = inflateSync(buf.subarray(start, Math.min(buf.length, start + bound)));
+    result = inflateSync(buf.subarray(start, Math.min(buf.length, start + bound)), { info: true }) as unknown as InflateInfo;
   } catch {
     try {
-      data = inflateSync(buf.subarray(start));
+      result = inflateSync(buf.subarray(start), { info: true }) as unknown as InflateInfo;
     } catch {
       throw new Error('corrupt zlib stream in pack');
     }
   }
+  const data = result.buffer;
+  const consumed = result.engine.bytesWritten;
   if (data.length !== size) throw new Error('pack entry size mismatch');
-  const needle = Buffer.alloc(4);
-  needle.writeUInt32BE(adler32(data), 0);
-  let from = start + 2;
-  for (;;) {
-    const at = buf.indexOf(needle, from);
-    if (at < 0) throw new Error('pack entry zlib stream end not found');
-    const end = at + 4;
-    try {
-      const check = inflateSync(buf.subarray(start, end));
-      if (check.length === size) return { data: check, next: end };
-    } catch {
-      // A false-positive trailer match: a truncated stream cannot inflate.
-    }
-    from = at + 1;
-  }
+  if (consumed <= 0) throw new Error('invalid zlib stream length');
+  return { data, next: start + consumed };
 }
 
 function readPackVarint(buf: Buffer, off: number): { type: number; size: number; next: number } {
