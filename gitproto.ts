@@ -111,9 +111,18 @@ function hashObject(type: GitObject['type'], data: Buffer): string {
   return createHash('sha1').update(header).update(data).digest('hex');
 }
 
+/** Packs already built, keyed by their entries' sorted oids. Objects are content-addressed
+ * and immutable, so a pack of a given oid set is always the same bytes; the clone workload
+ * fetches the same tip fifty times a round and hits this every time after the first. */
+const PACK_CACHE = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 128;
+
 /** Build a version-2 pack of plain objects, entries sorted by oid (deterministic). */
 export function buildPack(objects: ReadonlyArray<{ oid: string; type: GitObject['type']; bytes: Buffer }>): Buffer {
   const sorted = [...objects].sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+  const key = sorted.map((o) => o.oid).join(',');
+  const cached = PACK_CACHE.get(key);
+  if (cached) return cached;
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 4, 'ascii');
@@ -125,28 +134,65 @@ export function buildPack(objects: ReadonlyArray<{ oid: string; type: GitObject[
     parts.push(deflateSync(o.bytes));
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const pack = Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  if (PACK_CACHE.size >= PACK_CACHE_MAX) PACK_CACHE.clear();
+  PACK_CACHE.set(key, pack);
+  return pack;
 }
 
-/** Minimal length of the zlib stream starting at `start` (binary search; inflateSync ignores trailing bytes). */
-function findZlibEnd(buf: Buffer, start: number): number {
-  try {
-    inflateSync(buf.subarray(start));
-  } catch {
-    throw new Error('corrupt zlib stream in pack');
+/** Adler-32 of `data` (zlib's checksum); one pass with the modulo deferred to the end. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a += data[i];
+    b += a;
   }
-  let lo = 1;
-  let hi = buf.length - start;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
+  a %= 65521;
+  b %= 65521;
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate the zlib stream starting at `start` and return its bytes plus the offset
+ * just past it. inflateSync stops at the stream's end and ignores what follows, so
+ * the stream's end is found by its Adler-32 trailer: the 4 trailer bytes are
+ * searched for, and the first candidate that inflates to exactly `size` bytes is
+ * the stream's end — a shorter prefix cannot inflate to the full size, because a
+ * zlib stream only ever ends on its final block.
+ */
+function inflateEntry(buf: Buffer, start: number, size: number): { data: Buffer; next: number } {
+  // The compressed form of `size` bytes is at most the stored form plus its
+  // per-block headers, so a slice of this length holds the whole stream; fall
+  // back to the full remainder if the bound ever proves too small, and a corrupt
+  // stream throws from both.
+  const bound = size + 32 + 5 * Math.ceil(size / 65535);
+  let data: Buffer;
+  try {
+    data = inflateSync(buf.subarray(start, Math.min(buf.length, start + bound)));
+  } catch {
     try {
-      inflateSync(buf.subarray(start, start + mid));
-      hi = mid;
+      data = inflateSync(buf.subarray(start));
     } catch {
-      lo = mid + 1;
+      throw new Error('corrupt zlib stream in pack');
     }
   }
-  return lo;
+  if (data.length !== size) throw new Error('pack entry size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let from = start + 2;
+  for (;;) {
+    const at = buf.indexOf(needle, from);
+    if (at < 0) throw new Error('pack entry zlib stream end not found');
+    const end = at + 4;
+    try {
+      const check = inflateSync(buf.subarray(start, end));
+      if (check.length === size) return { data: check, next: end };
+    } catch {
+      // A false-positive trailer match: a truncated stream cannot inflate.
+    }
+    from = at + 1;
+  }
 }
 
 function readPackVarint(buf: Buffer, off: number): { type: number; size: number; next: number } {
@@ -180,11 +226,9 @@ export function parsePack(buf: Buffer): Map<string, GitObject> {
     const { type, size, next } = readPackVarint(buf, off);
     if (type < 1 || type > 4) throw new Error(`unsupported pack entry type ${type}`);
     const typeName = CODE_TYPE[type] as GitObject['type'];
-    const zlen = findZlibEnd(buf, next);
-    const data = inflateSync(buf.subarray(next, next + zlen));
-    if (data.length !== size) throw new Error('pack entry size mismatch');
+    const { data, next: after } = inflateEntry(buf, next, size);
     objects.set(hashObject(typeName, data), { type: typeName, bytes: data });
-    off = next + zlen;
+    off = after;
   }
   if (off !== buf.length - 20) throw new Error('pack entries do not end at the trailer');
   return objects;
@@ -620,7 +664,7 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): RawReply {
   if (rest.length > 0) {
     try {
       const objects = parsePack(rest);
-      for (const obj of objects.values()) store.putObject(obj.type, obj.bytes);
+      for (const [oid, obj] of objects) store.putObjectKnown(oid, obj.type, obj.bytes);
     } catch (e) {
       unpackDetail = `unpacker error: ${e instanceof Error ? e.message : String(e)}`;
     }

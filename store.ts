@@ -173,6 +173,12 @@ export class Store {
     return oid;
   }
 
+  /** Store an object whose oid is already known (e.g. a pack just parsed, which hashed
+   * every entry to build its map): skips the second SHA-1 over the same bytes. */
+  putObjectKnown(oid: string, type: GitObject['type'], bytes: Buffer): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, bytes });
+  }
+
   getObject(oid: string): GitObject | undefined {
     return this.objects.get(oid);
   }
